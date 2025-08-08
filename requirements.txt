@@ -1,0 +1,7 @@
+python-telegram-bot==20.7
+requests
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+python-dotenv
+apscheduler
