@@ -5,3 +5,5 @@ google-auth-httplib2
 google-auth-oauthlib
 python-dotenv
 apscheduler
+dateparser
+tzdata; platform_system=="Windows"

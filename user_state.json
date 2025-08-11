@@ -1,0 +1,32 @@
+{
+  "613340341": {
+    "visit_time": null,
+    "client_name": null,
+    "client_phone": null,
+    "service": null,
+    "child_age": null,
+    "date": null,
+    "time": null,
+    "greeted": true,
+    "last_interaction": "2025-08-11T21:07:27.188953+03:00",
+    "pending_date": null
+  },
+  "619714327": {
+    "visit_time": "2025-08-11T18:30:00",
+    "client_name": null,
+    "client_phone": null,
+    "service": null,
+    "child_age": null,
+    "awaiting_name": false,
+    "awaiting_phone": false
+  },
+  "5348618098": {
+    "visit_time": null,
+    "client_name": null,
+    "client_phone": null,
+    "service": null,
+    "child_age": null,
+    "awaiting_name": false,
+    "awaiting_phone": false
+  }
+}
