@@ -37,3 +37,21 @@ def schedule_reminders(application, chat_id, visit_time):
             ),
             'date', run_date=one_hour_before
         )
+
+def schedule_monthly_reminder(application, chat_id, visit_time):
+    """
+    Планирует напоминание через 1 месяц после визита.
+    """
+    tz = ZoneInfo('Europe/Moscow')
+    if visit_time.tzinfo is None:
+        visit_time = visit_time.replace(tzinfo=tz)
+    month_later = visit_time + timedelta(days=30)
+    now = datetime.now(tz=tz)
+    if month_later > now:
+        scheduler.add_job(
+            lambda: application.bot.send_message(
+                chat_id,
+                "Прошел месяц с вашей последней стрижки! Может, пора освежить образ? Запишитесь в 'Непоседы' — всегда рады видеть вас снова 😊"
+            ),
+            'date', run_date=month_later
+        )
