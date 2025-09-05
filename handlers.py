@@ -104,29 +104,58 @@ def normalize_ru_phone(raw_phone: str) -> Optional[str]:
     """Пытается привести номер к формату +7XXXXXXXXXX. Возвращает None, если номер некорректен."""
     if not raw_phone:
         return None
+    
+    # Убираем все нецифровые символы
     digits = re.sub(r'\D', '', raw_phone)
-    # 11 цифр, начинается с 7 или 8 → нормализуем к 7
-    if len(digits) == 11 and digits[0] in ('7', '8'):
-        digits = '7' + digits[1:]
-    # 10 цифр, начинается с 9 → добавим 7 (часто пишут без кода страны)
-    elif len(digits) == 10 and digits[0] == '9':
-        digits = '7' + digits
-    else:
-        return None
-    return '+7' + digits[1:]
+    
+    # Проверяем длину и корректность
+    if len(digits) == 11:
+        # 11 цифр: 7XXXXXXXXXX или 8XXXXXXXXXX
+        if digits[0] in ('7', '8'):
+            return '+7' + digits[1:]
+    elif len(digits) == 10:
+        # 10 цифр: 9XXXXXXXXX или 8XXXXXXXXX (без кода страны)
+        if digits[0] in ('9', '8'):
+            return '+7' + digits
+    elif len(digits) == 12:
+        # 12 цифр: 89XXXXXXXXXX (с лишней 8)
+        if digits[0:2] == '89':
+            return '+7' + digits[2:]
+    
+    return None
 
 def suggest_time_slots(for_date: datetime.date, preference: Optional[str] = None) -> list[str]:
-    """Возвращает 2–3 рекомендованных слота времени в зависимости от предпочтения."""
+    """
+    Возвращает 2–3 рекомендованных слота времени в зависимости от предпочтения,
+    но только те, что ещё не прошли (если дата — сегодня).
+    """
     morning = ["10:00", "11:30"]
     day = ["14:00", "15:30"]
     evening = ["18:00", "19:00"]
+    slots = []
     if preference == 'morning':
-        return morning + [day[0]]
-    if preference == 'day':
-        return day + [evening[0]]
-    if preference == 'evening':
-        return evening + [day[0]]
-    return [morning[0], day[0], evening[0]]
+        slots = morning + [day[0]]
+    elif preference == 'day':
+        slots = day + [evening[0]]
+    elif preference == 'evening':
+        slots = evening + [day[0]]
+    else:
+        slots = [morning[0], day[0], evening[0]]
+
+    # Фильтруем слоты, если дата — сегодня
+    now = datetime.datetime.now(tz=TZ)
+    if for_date == now.date():
+        filtered = []
+        for s in slots:
+            hour, minute = map(int, s.split(':'))
+            slot_dt = datetime.datetime.combine(for_date, datetime.time(hour, minute), tzinfo=TZ)
+            if slot_dt > now:
+                filtered.append(s)
+        return filtered
+    # Если дата в прошлом — не предлагать ничего
+    if for_date < now.date():
+        return []
+    return slots
 
 def detect_time_preference(text: str) -> Optional[str]:
     t = text.lower()
@@ -220,6 +249,216 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text_raw = update.message.text
     user_text = user_text_raw.lower()
 
+    # --- Управление памятью: исправление и сброс ---
+    if 'удалить данные' in user_text or 'сбросить' in user_text:
+        context.user_data.clear()
+        await update.message.reply_text("Все ваши данные удалены. Начнём заново!")
+        return
+
+    if 'изменить номер' in user_text or 'новый телефон' in user_text or 'мой телефон' in user_text:
+        phone_match = re.search(r'(\+?\d[\d\s\-\(\)]{8,})', user_text_raw)
+        if phone_match:
+            new_phone = normalize_ru_phone(phone_match.group(1))
+            if new_phone:
+                context.user_data['client_phone'] = new_phone
+                _save_context_state(chat_id, context)
+                await update.message.reply_text(f"Ваш номер телефона обновлён: {new_phone}")
+            else:
+                await update.message.reply_text("Не удалось распознать номер. Пожалуйста, укажите его в формате +7 9ХХ ХХХ-ХХ-ХХ.")
+        else:
+            await update.message.reply_text("Пожалуйста, напишите новый номер телефона.")
+        return
+
+    if 'перенести запись' in user_text or 'изменить дату' in user_text or 'новое время' in user_text:
+        parsed_dt = dateparser.parse(user_text_raw, languages=['ru'], settings={'PREFER_DATES_FROM': 'future', 'RELATIVE_BASE': datetime.datetime.now()})
+        if parsed_dt:
+            if parsed_dt.tzinfo is None:
+                parsed_dt = parsed_dt.replace(tzinfo=TZ)
+            context.user_data['visit_time'] = parsed_dt
+            context.user_data['date'] = parsed_dt.date().isoformat()
+            context.user_data['time'] = parsed_dt.strftime('%H:%M')
+            _save_context_state(chat_id, context)
+            await update.message.reply_text(f"Ваша запись перенесена на {parsed_dt.strftime('%d.%m.%Y %H:%M')}")
+        else:
+            await update.message.reply_text("Пожалуйста, укажите новую дату и время (например: 'перенести запись на 15 сентября к 14:00').")
+        return
+
+    # --- Фильтр намерения: запись или свободный вопрос ---
+    intent_words = [
+        "записаться", "записать", "хочу стрижку", "хочу укладку", "стрижку", "укладку", "постричься", "подстричься", "освежить",
+        "стрижка", "укладка", "окрашивание", "окрасить", "парикмахер", "мастер", "парикмахерская", "салон", "услуга"
+    ]
+    if any(word in user_text for word in intent_words):
+        # --- Пошаговый сбор данных и живой диалог (сценарий записи) ---
+        # 1. Попробовать извлечь имя и телефон из сообщения
+        name_phone_match = re.match(r'^\s*([А-Яа-яA-Za-zЁё\-\s]+)[,;\s]+(\+?\d[\d\s\-\(\)]{8,})\s*$', user_text_raw)
+        if name_phone_match:
+            context.user_data['client_name'] = name_phone_match.group(1).strip()
+            phone_norm = normalize_ru_phone(name_phone_match.group(2).strip())
+            if phone_norm:
+                context.user_data['client_phone'] = phone_norm
+            _save_context_state(chat_id, context)
+
+        # 2. Попробовать извлечь только телефон
+        phone_match = re.search(r'(\+?\d[\d\s\-\(\)]{8,})', user_text_raw)
+        if phone_match and not context.user_data.get('client_phone'):
+            phone_norm = normalize_ru_phone(phone_match.group(1))
+            if phone_norm:
+                context.user_data['client_phone'] = phone_norm
+                _save_context_state(chat_id, context)
+
+        # 3. Попробовать извлечь только имя (если нет телефона)
+        if not context.user_data.get('client_name') and len(user_text_raw.split()) == 1 and user_text_raw.isalpha():
+            context.user_data['client_name'] = user_text_raw.strip().capitalize()
+            _save_context_state(chat_id, context)
+
+        # 4. Попробовать извлечь дату/время (универсальный парсер)
+        if not context.user_data.get('visit_time'):
+            parsed_dt = dateparser.parse(user_text_raw, languages=['ru'], settings={'PREFER_DATES_FROM': 'future', 'RELATIVE_BASE': datetime.datetime.now()})
+            if parsed_dt:
+                if parsed_dt.tzinfo is None:
+                    parsed_dt = parsed_dt.replace(tzinfo=TZ)
+                context.user_data['visit_time'] = parsed_dt
+                context.user_data['date'] = parsed_dt.date().isoformat()
+                context.user_data['time'] = parsed_dt.strftime('%H:%M')
+                _save_context_state(chat_id, context)
+
+        # 5. Попробовать извлечь услугу
+        if not context.user_data.get('service'):
+            if 'стрижк' in user_text:
+                context.user_data['service'] = 'Стрижка'
+            elif 'укладк' in user_text:
+                context.user_data['service'] = 'Укладка'
+            elif 'окраш' in user_text or 'колор' in user_text:
+                context.user_data['service'] = 'Окрашивание'
+            _save_context_state(chat_id, context)
+
+        # 6. Проверить, хватает ли всего для записи
+        required_fields = ['client_name', 'client_phone', 'visit_time', 'service']
+        missing = [f for f in required_fields if not context.user_data.get(f)]
+        known = []
+        if context.user_data.get('client_name'):
+            known.append(f"Имя: {context.user_data['client_name']}")
+        if context.user_data.get('client_phone'):
+            known.append(f"Телефон: {context.user_data['client_phone']}")
+        if context.user_data.get('visit_time'):
+            known.append(f"Дата и время: {context.user_data['visit_time'].strftime('%d.%m.%Y %H:%M')}")
+        if context.user_data.get('service'):
+            known.append(f"Услуга: {context.user_data['service']}")
+
+        if not missing:
+            # Всё есть — создаём запись
+            name = context.user_data['client_name']
+            phone = context.user_data['client_phone']
+            visit_time = context.user_data['visit_time']
+            service = context.user_data['service']
+            try:
+                event_id = book_slot(visit_time, {
+                    'name': name,
+                    'phone': phone,
+                    'service': service,
+                    'child_age': context.user_data.get('child_age', '—')
+                })
+                client_id = upsert_client(name, phone)
+                add_booking(client_id, visit_time.isoformat(), service, event_id)
+                schedule_reminders(application=context.application, chat_id=chat_id, visit_time=visit_time)
+                schedule_monthly_reminder(application=context.application, chat_id=chat_id, visit_time=visit_time)
+                admin_message = (
+                    f"📅 НОВАЯ ЗАПИСЬ!\n\n👤 {name}\n📱 {phone}\n🕐 {visit_time:%d.%m.%Y %H:%M}\n💇‍♀️ {service}"
+                )
+                await send_chunked(context, ADMIN_CHAT_ID, admin_message)
+                await send_chunked(
+                    context,
+                    chat_id,
+                    f"Готово!\nИмя: {name}\nТелефон: {phone}\nУслуга: {service}\nКогда: {visit_time:%d.%m.%Y %H:%M}\n"
+                    "Я напомню за день и за час до визита. До встречи в «Непоседах»!"
+                )
+                _reset_context(context)
+                _save_context_state(chat_id, context)
+            except Exception as e:
+                print(f"[ОШИБКА] При создании записи (живой ассистент): {e}")
+                await update.message.reply_text("Произошла ошибка при создании записи.")
+            return
+        else:
+            # Не хватает чего-то — спрашиваем только это
+            if 'client_name' in missing and 'client_phone' in missing:
+                await update.message.reply_text(
+                    f"{'; '.join(known)}\n\nПришлите, пожалуйста, имя и номер телефона в одном сообщении."
+                )
+                return
+            if 'client_name' in missing:
+                await update.message.reply_text(
+                    f"{'; '.join(known)}\n\nПожалуйста, напишите ваше имя."
+                )
+                return
+            if 'client_phone' in missing:
+                await update.message.reply_text(
+                    f"{'; '.join(known)}\n\nПожалуйста, напишите ваш номер телефона."
+                )
+                return
+            if 'visit_time' in missing:
+                await update.message.reply_text(
+                    f"{'; '.join(known)}\n\nКогда вам удобно записаться? Назовите дату и время."
+                )
+                return
+            if 'service' in missing:
+                await update.message.reply_text(
+                    f"{'; '.join(known)}\n\nКакую услугу вы хотите? (стрижка, укладка, окрашивание и т.д.)"
+                )
+                return
+        # Если не удалось распознать ничего — fallback
+        await update.message.reply_text(
+            "Извините, я не совсем поняла. Пожалуйста, уточните, что вы хотите: дату, время, имя, телефон или услугу."
+        )
+        return
+    else:
+        # --- Свободный вопрос: ответ через DeepSeek (ИИ) ---
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+        first_name = context.user_data.get('tg_first_name') or ''
+        username = context.user_data.get('tg_username') or ''
+        user_meta = f"(id:{user_id} {first_name} @{username})".strip()
+        history = context.user_data.get('history', [])[-8:]
+        history.append({"role": "user", "content": f"{user_meta}: {user_text_raw}"})
+        context.user_data['history'] = history
+        _save_context_state(chat_id, context)
+        try:
+            response = ask_deepseek(user_text_raw, history=history)
+            print(f"[ОТЛАДКА] Ответ ИИ: {response}")
+            if response and response != "Извините, сейчас не могу ответить. Попробуйте позже.":
+                history.append({"role": "assistant", "content": response})
+                context.user_data['history'] = history
+                await send_chunked(context, chat_id, response)
+                return
+            else:
+                fallback_response = (
+                    "Здравствуйте! 😊 Я — ассистент администратора салона «Непоседы». "
+                    "Помогу вам с записью на стрижку, укладку или другие услуги. "
+                    "На какой день и время вам удобно подойти?"
+                )
+                await update.message.reply_text(fallback_response)
+        except Exception as e:
+            print(f"[ОШИБКА] При обращении к DeepSeek: {e}")
+            fallback_response = (
+                "Здравствуйте! 😊 Я — ассистент администратора салона «Непоседы». "
+                "Помогу вам с записью на стрижку, укладку или другие услуги. "
+                "На какой день и время вам удобно подойти?"
+            )
+            await update.message.reply_text(fallback_response)
+        return
+
+    # --- Fallback: если пользователь просто здоровается, сразу отправить приветствие и завершить обработку ---
+    greetings = [
+        'привет', 'здравствуйте', 'добрый день', 'доброе утро', 'добрый вечер', 'хай', 'hello', 'hi'
+    ]
+    if user_text.strip() in greetings and not context.user_data.get('greeted', False):
+        context.user_data['greeted'] = True
+        _save_context_state(chat_id, context)
+        greeting = (
+            "Здравствуйте! 😊 Я — ассистент администратора салона «Непоседы». Чем могу помочь?"
+        )
+        await update.message.reply_text(greeting)
+        return
+
     # Сохраняем идентификаторы Telegram для персонализации и админ-уведомлений
     tg_user = update.effective_user
     context.user_data['tg_user_id'] = tg_user.id
@@ -238,121 +477,44 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pass
     _save_context_state(chat_id, context)
 
-    greetings = ["здравств", "добрый день", "доброе утро", "добрый вечер", "привет"]
-    has_greeting = any(greet in user_text for greet in greetings)
-
-    # --- 1. Сначала анализируем вопросы о времени/слотах ---
-    slot_intent_words = [
-        'свободн', 'есть время', 'какие слоты', 'какие окна', 'какое время', 'доступно', 'можно записаться', 'свободное время', 'есть ли', 'окна', 'слоты'
-    ]
-    if any(word in user_text for word in slot_intent_words):
-        target_date = None
-        if 'сегодня' in user_text:
-            target_date = datetime.datetime.now(tz=TZ).date()
-        elif 'завтра' in user_text:
-            target_date = (datetime.datetime.now(tz=TZ) + datetime.timedelta(days=1)).date()
-        elif 'послезавтра' in user_text:
-            target_date = (datetime.datetime.now(tz=TZ) + datetime.timedelta(days=2)).date()
-        else:
-            parsed_dt = dateparser.parse(user_text, languages=['ru'], settings={'PREFER_DATES_FROM': 'future', 'RELATIVE_BASE': datetime.datetime.now()})
-            if parsed_dt:
-                target_date = parsed_dt.date()
-        if target_date:
-            reply_parts = []
-            if has_greeting and not context.user_data.get('greeted', False):
-                context.user_data['greeted'] = True
-                _save_context_state(chat_id, context)
-                hello_name = f", {context.user_data.get('tg_first_name')}" if context.user_data.get('tg_first_name') else ""
-                reply_parts.append(f"Здравствуйте{hello_name}! 😊 Я — ассистент администратора салона «Непоседы».")
-            elif has_greeting:
-                reply_parts.append("Здравствуйте! Я на связи 😊")
-            reply_parts.append('Минутку, сейчас посмотрю...')
-            await update.message.reply_text(' '.join(reply_parts))
-            free_slots = get_free_slots(target_date)
-            date_str = target_date.strftime('%d.%m.%Y')
-            if free_slots:
-                context.user_data['pending_date'] = target_date.isoformat()
-                _save_context_state(chat_id, context)
-                await update.message.reply_text(
-                    f'На {date_str} свободно: {", ".join(free_slots)}. Какое время вам удобно?'
-                )
+    # Обработка админ-команд
+    if user_id == ADMIN_CHAT_ID:
+        if user_text.startswith('/admin_today'):
+            today = datetime.datetime.now(tz=TZ).date()
+            events = list_events_for_date(today)
+            await update.message.reply_text('\n'.join(
+                f"{datetime.datetime.fromisoformat(e['start'].get('dateTime')).strftime('%H:%M')} — {e.get('summary', 'Запись')}" for e in events
+            ) or 'Сегодня записей нет.')
+            return
+        if user_text.startswith('/admin_date'):
+            parts = user_text.split()
+            if len(parts) != 2:
+                await update.message.reply_text('Использование: /admin_date YYYY-MM-DD')
+                return
+            date = datetime.date.fromisoformat(parts[1])
+            events = list_events_for_date(date)
+            await update.message.reply_text('\n'.join(
+                f"{datetime.datetime.fromisoformat(e['start'].get('dateTime')).strftime('%H:%M')} — {e.get('summary', 'Запись')}" for e in events
+            ) or 'Записей нет.')
+            return
+        if user_text.startswith('/admin_cancel'):
+            parts = user_text.split()
+            if len(parts) == 2 and delete_event(parts[1]):
+                await update.message.reply_text('Отменено.')
             else:
-                await update.message.reply_text(f'К сожалению, на {date_str} свободных слотов нет. Может, предложить другой день?')
+                await update.message.reply_text('Не удалось отменить.')
             return
-        else:
-            reply_parts = []
-            if has_greeting and not context.user_data.get('greeted', False):
-                context.user_data['greeted'] = True
-                _save_context_state(chat_id, context)
-                hello_name = f", {context.user_data.get('tg_first_name')}" if context.user_data.get('tg_first_name') else ""
-                reply_parts.append(f"Здравствуйте{hello_name}! 😊 Я — ассистент администратора салона «Непоседы».")
-            elif has_greeting:
-                reply_parts.append("Здравствуйте! Я на связи 😊")
-            reply_parts.append('Пожалуйста, уточните дату, на которую хотите узнать свободное время (например: "завтра", "в субботу", "на 15 августа").')
-            await update.message.reply_text(' '.join(reply_parts))
+        if user_text.startswith('/admin_move'):
+            parts = user_text.split()
+            if len(parts) != 4:
+                await update.message.reply_text('Использование: /admin_move <event_id> YYYY-MM-DD HH:MM')
+                return
+            date = datetime.date.fromisoformat(parts[2])
+            hour, minute = map(int, parts[3].split(':'))
+            ok = update_event_time(parts[1], datetime.datetime.combine(date, datetime.time(hour, minute)))
+            await update.message.reply_text('Перенесено.' if ok else 'Не удалось перенести.')
             return
-
-    # --- Новый блок: если есть pending_date и клиент пишет только время ---
-    pending_date_iso = context.user_data.get('pending_date')
-    if pending_date_iso:
-        # Ищем время в сообщении (например, "на 17.00", "в 10", "15:30")
-        t = re.search(r'(\d{1,2})\s*(?:[:\.\-]?\s*(\d{2}))?', user_text)
-        if t:
-            hour = int(t.group(1))
-            minute = int((t.group(2) or '0'))
-            pd = datetime.date.fromisoformat(pending_date_iso)
-            visit_time = datetime.datetime.combine(pd, datetime.time(hour, minute), tzinfo=TZ)
-            context.user_data['visit_time'] = visit_time
-            context.user_data.pop('pending_date', None)
-            context.user_data['date'] = pd.isoformat()
-            context.user_data['time'] = f"{hour:02d}:{minute:02d}"
-            _save_context_state(chat_id, context)
-            # Продолжаем диалог: просим имя и телефон
-            await update.message.reply_text(
-                f"Отлично! {visit_time.strftime('%d.%m.%Y')} в {visit_time.strftime('%H:%M')} записываю.\nПришлите, пожалуйста, имя и номер телефона в одном сообщении.\nНапример: Анна, +7 999 123-45-67"
-            )
-            return
-
-    # --- 2. Если только приветствие — обычный ответ ---
-    if has_greeting:
-        if not context.user_data.get('greeted', False):
-            context.user_data['greeted'] = True
-            _save_context_state(chat_id, context)
-            hello_name = f", {context.user_data.get('tg_first_name')}" if context.user_data.get('tg_first_name') else ""
-            greeting = f"Здравствуйте{hello_name}! 😊 Я — ассистент администратора салона «Непоседы». Чем могу помочь?"
-            await update.message.reply_text(greeting)
-            return
-        else:
-            await update.message.reply_text("Здравствуйте! Я на связи 😊")
-            return
-
-    # Быстрые правила: вопросы про цены/стоимость → отвечаем сразу ценой
-    if any(kw in user_text for kw in ["цена", "стоимост", "сколько", "прайс", "сколько стоит", "по чём", "почем"]):
-        if any(x in user_text for x in ["детск", "ребён", "ребен", "взросл", "стриж"]):
-            answer = "Детская и взрослая стрижка — от 800₽. Хотите записаться? Могу предложить удобное время."
-        elif any(x in user_text for x in ["уклад", "плетен"]):
-            answer = "Укладки и плетения — с радостью предложим, стоимость зависит от сложности. Хотите узнать подробнее или записаться?"
-        elif any(x in user_text for x in ["окраш"]):
-            answer = "Окрашивание — стоимость индивидуальна, зависит от длины и сложности. Хотите узнать подробнее или записаться?"
-        else:
-            answer = "Мы предлагаем стрижки, укладки, окрашивания и плетение. Подскажите, что вас интересует?"
-        await send_chunked(context, chat_id, answer)
-
-    # Проверка на обращения к админу (по корню 'админ')
-    if "админ" in user_text:
-        await send_chunked(context, chat_id, "Я передам ваш запрос администратору. Он свяжется с вами в ближайшее время.")
-        await send_chunked(context, ADMIN_CHAT_ID, f"Клиент просит связаться: id={user_id}, username={getattr(update.effective_user, 'username', None)}")
-        return
-
-    # Напоминание
-    if re.search(r'напомн(и|ить|ание)', user_text):
-        visit_time_ctx = context.user_data.get('visit_time')
-        if visit_time_ctx:
-            schedule_reminders(application=context.application, chat_id=chat_id, visit_time=visit_time_ctx)
-            await update.message.reply_text("Я напомню вам за день и за час до визита.")
-        else:
-            await update.message.reply_text("Сначала укажите дату и время визита.")
-        return
+    # --- конец блока ---
 
     print(f"[ОТЛАДКА] Обрабатываем текст: '{user_text_raw}'")
 
@@ -396,11 +558,11 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     print(f"[ОШИБКА] При создании записи (ранний блок): {e}")
                     await update.message.reply_text("Произошла ошибка при создании записи.")
                 return
-        else:
-            await update.message.reply_text(
-                "Похоже, номер указан некорректно. Укажите, пожалуйста, номер в формате +7 9ХХ ХХХ-ХХ-ХХ."
-            )
-            return
+            else:
+                await update.message.reply_text(
+                    "Похоже, номер указан некорректно. Укажите, пожалуйста, номер в формате +7 9ХХ ХХХ-ХХ-ХХ."
+                )
+                return
 
     visit_time: Optional[datetime.datetime] = None
 
@@ -415,6 +577,9 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         r'(понедельник|вторник|среда|среду|четверг|пятница|пятницу|суббота|субботу|воскресенье)\b'
     )
 
+    # Новый блок: ищем явное указание "на следующей неделе"
+    is_next_week = bool(re.search(r'на следующей неделе|следующая неделя', user_text))
+
     m = rel_day_regex.search(user_text)
     processed_text = user_text
     if m:
@@ -427,7 +592,7 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         days_until = (target_wd - current_wd) % 7
 
         # Логика смещения
-        if prefix.startswith('следующ'):
+        if prefix.startswith('следующ') or is_next_week:
             days_until = (days_until or 7) + 7  # всегда на следующую неделю
         else:
             if days_until == 0:
@@ -475,26 +640,22 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             # Немедленно просим имя и телефон, но без утверждения, что слот свободен
             await update.message.reply_text(
-                (
-                    f"Отлично! {target_date.strftime('%d.%m.%Y')} в {hour:02d}:{minute:02d}. "
-                    "Пришлите, пожалуйста, имя и номер телефона в одном сообщении.\n"
-                    "Например: Анна, +7 999 123-45-67"
-                )
+                f"Отлично! {target_date.strftime('%d.%m.%Y')} в {hour:02d}:{minute:02d}. "
+                "Пришлите, пожалуйста, имя и номер телефона в одном сообщении.\n"
+                "Например: Анна, +7 999 123-45-67"
             )
             return
         else:
-            # Время не указано — предложим 2–3 варианта и сохраним pending_date
+            # Если время не найдено, просто запомнить дату и предложить выбрать время
             context.user_data['pending_date'] = target_date.isoformat()
+            context.user_data['date'] = target_date.isoformat()
             _save_context_state(chat_id, context)
             pref = detect_time_preference(user_text)
             slots = suggest_time_slots(target_date, pref)
             await update.message.reply_text(
-                (
-                    f"Поняла, {target_date.strftime('%d.%m.%Y')} удобно. Во сколько предпочитаете? "
-                    f"Могу предложить: {', '.join(slots)}."
-                )
+                f"Отлично! {target_date.strftime('%d.%m.%Y')} подойдёт. Во сколько вам удобно? Могу предложить: {', '.join(slots)}."
             )
-        return
+            return
     else:
         print("[ОТЛАДКА] Не найден относительный день недели")
         # Не найден относительный день недели — не трогаем target_date, продолжаем дальше
@@ -527,6 +688,9 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             else:
                 visit_time = parsed_dt
+                if visit_time <= datetime.datetime.now(tz=TZ):
+                    await update.message.reply_text("Это время уже прошло. Пожалуйста, выберите другое время для записи.")
+                    return
                 context.user_data['visit_time'] = visit_time
                 context.user_data['date'] = visit_time.date().isoformat()
                 context.user_data['time'] = visit_time.strftime('%H:%M')
@@ -536,7 +700,7 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "Не удалось распознать дату и время. Пожалуйста, укажите, когда вам удобно записаться (например: 'в субботу утром', 'на 15 августа к 14:00')."
             )
-            return
+        # конец блока universal dateparser
 
     # 3) Если ранее выбрана дата (pending_date) и сейчас пришло время
     if visit_time is None:
@@ -548,6 +712,9 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 minute = int((t.group(2) or '0'))
                 pd = datetime.date.fromisoformat(pending_date_iso)
                 visit_time = datetime.datetime.combine(pd, datetime.time(hour, minute), tzinfo=TZ)
+                if visit_time <= datetime.datetime.now(tz=TZ):
+                    await update.message.reply_text("Это время уже прошло. Пожалуйста, выберите другое время для записи.")
+                    return
                 context.user_data['visit_time'] = visit_time
                 context.user_data.pop('pending_date', None)
                 context.user_data['date'] = pd.isoformat()
@@ -636,6 +803,17 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # 5) Иначе — обычный диалог через LLM
+    # --- ДОБАВЛЯЕМ ФИЛЬТР ТЕМАТИКИ ---
+    topic_keywords = [
+        'волос', 'стриж', 'салон', 'уклад', 'цена', 'запис', 'мастер', 'парикмах', 'уход',
+        'детск', 'взросл', 'плетен', 'окраш', 'красот', 'причес', 'причёск', 'консультац', 'совет'
+    ]
+    if not any(kw in user_text for kw in topic_keywords):
+        await update.message.reply_text(
+            'Я могу помочь только по вопросам салона красоты, стрижек и ухода за волосами. Чем могу быть полезна?'
+        )
+        return
+    # --- КОНЕЦ ФИЛЬТРА ---
     if user_id == ADMIN_CHAT_ID:
         if user_text.startswith('/admin_today'):
             today = datetime.datetime.now(tz=TZ).date()
@@ -673,9 +851,8 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text('Перенесено.' if ok else 'Не удалось перенести.')
             return
 
-    # Остальной диалог через LLM (админ-команды уже обработаны выше)
+    # --- LLM (DeepSeek) — первый обработчик любого сообщения ---
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
-    # Поддерживаем краткую историю диалога в памяти
     first_name = context.user_data.get('tg_first_name') or ''
     username = context.user_data.get('tg_username') or ''
     user_meta = f"(id:{user_id} {first_name} @{username})".strip()
@@ -683,12 +860,16 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['history'] = history
     _save_context_state(chat_id, context)
     try:
-        # Передаём LLM сокращённый, но информативный контекст и системный стиль уже задан.
         response = ask_deepseek(user_text_raw, history=history)
+        print(f"[ОТЛАДКА] Ответ ИИ: {response}")
         if response and response != "Извините, сейчас не могу ответить. Попробуйте позже.":
             history.append({"role": "assistant", "content": response})
             context.user_data['history'] = history
             await send_chunked(context, chat_id, response)
+            # --- Здесь можно анализировать response на предмет явного намерения записаться ---
+            # Например, если в ответе есть фраза "Давайте запишу вас" или "Когда вам удобно прийти?" — можно запустить сценарий записи
+            # (Оставляем как задел для будущей доработки)
+            return
         else:
             fallback_response = (
                 "Здравствуйте! 😊 Я — ассистент администратора салона «Непоседы». "

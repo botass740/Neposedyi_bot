@@ -1,14 +1,14 @@
 {
   "613340341": {
-    "visit_time": "2025-08-28T17:00:00+03:00",
+    "visit_time": null,
     "client_name": null,
     "client_phone": null,
-    "service": null,
+    "service": "Стрижка",
     "child_age": null,
-    "date": "2025-08-28",
-    "time": "17:00",
+    "date": null,
+    "time": null,
     "greeted": true,
-    "last_interaction": "2025-08-27T20:06:22.753288+03:00",
+    "last_interaction": "2025-09-05T18:31:42.380540+03:00",
     "pending_date": null
   },
   "619714327": {
