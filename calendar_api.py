@@ -50,10 +50,14 @@ def get_free_slots(date):
         current_time = day_start.replace(hour=9, minute=0, second=0, microsecond=0)
         work_end = day_start.replace(hour=19, minute=0, second=0, microsecond=0)
 
+        # Текущее время для фильтрации прошедших слотов
+        now = datetime.now(tz=TZ)
+        
         while current_time < work_end:
             slot_end = current_time + timedelta(hours=1)
             overlap = any((current_time < b_end and slot_end > b_start) for b_start, b_end in busy)
-            if not overlap:
+            # Добавляем слот только если он не занят И не в прошлом
+            if not overlap and current_time > now:
                 free_slots.append(current_time.strftime('%H:%M'))
             current_time += timedelta(hours=1)
 

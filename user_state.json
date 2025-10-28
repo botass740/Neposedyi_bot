@@ -7,8 +7,8 @@
     "child_age": null,
     "date": null,
     "time": null,
-    "greeted": true,
-    "last_interaction": "2025-09-05T18:31:42.380540+03:00",
+    "greeted": false,
+    "last_interaction": "2025-10-28T19:02:05.484782+03:00",
     "pending_date": null
   },
   "619714327": {
@@ -22,11 +22,14 @@
   },
   "5348618098": {
     "visit_time": null,
-    "client_name": null,
-    "client_phone": null,
-    "service": null,
+    "client_name": "Ялы Сый",
+    "client_phone": "+79786543217",
+    "service": "Стрижка",
     "child_age": null,
-    "awaiting_name": false,
-    "awaiting_phone": false
+    "date": null,
+    "time": null,
+    "greeted": false,
+    "last_interaction": "2025-10-28T18:46:15.319730+03:00",
+    "pending_date": null
   }
 }
