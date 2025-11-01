@@ -55,3 +55,40 @@ def schedule_monthly_reminder(application, chat_id, visit_time):
             ),
             'date', run_date=month_later
         )
+
+
+def schedule_rating_request(application, chat_id, visit_time, master_name, booking_id):
+    """
+    Планирует запрос оценки через 3 часа после визита.
+    """
+    tz = ZoneInfo('Europe/Moscow')
+    if visit_time.tzinfo is None:
+        visit_time = visit_time.replace(tzinfo=tz)
+    three_hours_later = visit_time + timedelta(hours=3)
+    now = datetime.now(tz=tz)
+    if three_hours_later > now:
+        from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+        
+        def send_rating_request():
+            try:
+                keyboard = [
+                    [
+                        InlineKeyboardButton("⭐", callback_data=f"rate_{booking_id}_1"),
+                        InlineKeyboardButton("⭐⭐", callback_data=f"rate_{booking_id}_2"),
+                        InlineKeyboardButton("⭐⭐⭐", callback_data=f"rate_{booking_id}_3"),
+                    ],
+                    [
+                        InlineKeyboardButton("⭐⭐⭐⭐", callback_data=f"rate_{booking_id}_4"),
+                        InlineKeyboardButton("⭐⭐⭐⭐⭐", callback_data=f"rate_{booking_id}_5"),
+                    ]
+                ]
+                reply_markup = InlineKeyboardMarkup(keyboard)
+                application.bot.send_message(
+                    chat_id,
+                    f"Надеемся, вам понравилась стрижка у {master_name}! 💇‍♀️\n\nОцените, пожалуйста, работу мастера:",
+                    reply_markup=reply_markup
+                )
+            except Exception as e:
+                print(f"[ОШИБКА] Не удалось отправить запрос оценки: {e}")
+        
+        scheduler.add_job(send_rating_request, 'date', run_date=three_hours_later)

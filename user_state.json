@@ -1,35 +1,32 @@
 {
   "613340341": {
     "visit_time": null,
-    "client_name": null,
-    "client_phone": null,
-    "service": "Стрижка",
-    "child_age": null,
-    "date": null,
-    "time": null,
-    "greeted": false,
-    "last_interaction": "2025-10-28T19:02:05.484782+03:00",
-    "pending_date": null
-  },
-  "619714327": {
-    "visit_time": "2025-08-11T18:30:00",
-    "client_name": null,
+    "client_name": "Максим",
     "client_phone": null,
     "service": null,
     "child_age": null,
-    "awaiting_name": false,
-    "awaiting_phone": false
-  },
-  "5348618098": {
-    "visit_time": null,
-    "client_name": "Ялы Сый",
-    "client_phone": "+79786543217",
-    "service": "Стрижка",
-    "child_age": null,
     "date": null,
     "time": null,
     "greeted": false,
-    "last_interaction": "2025-10-28T18:46:15.319730+03:00",
-    "pending_date": null
+    "last_interaction": "2025-10-31T22:33:39.145958+03:00",
+    "pending_date": null,
+    "master_id": null,
+    "master_name": null,
+    "master_selection_shown": false
+  },
+  "5348618098": {
+    "visit_time": "2025-11-01T10:00:00+03:00",
+    "client_name": "Ялы Сый",
+    "client_phone": "+79786664252",
+    "service": null,
+    "child_age": null,
+    "date": "2025-11-01",
+    "time": "10:00",
+    "greeted": false,
+    "last_interaction": "2025-10-31T22:31:38.736671+03:00",
+    "pending_date": null,
+    "master_id": null,
+    "master_name": null,
+    "master_selection_shown": false
   }
 }

@@ -102,13 +102,15 @@ def book_slot(slot_time, client_data):
     try:
         start_dt = slot_time.replace(tzinfo=TZ)
         end_dt = (slot_time + timedelta(hours=1)).replace(tzinfo=TZ)
+        master_info = client_data.get("master", "Любой свободный мастер")
         event = {
             'summary': f'Запись: {client_data["name"]}',
             'description': (
                 f'Клиент: {client_data["name"]}\n'
                 f'Телефон: {client_data["phone"]}\n'
                 f'Услуга: {client_data.get("service", "Не указана")}\n'
-                f'Возраст ребёнка: {client_data.get("child_age", "—")}'
+                f'Возраст ребёнка: {client_data.get("child_age", "—")}\n'
+                f'Мастер: {master_info}'
             ),
             'start': {
                 'dateTime': start_dt.isoformat(),

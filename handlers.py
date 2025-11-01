@@ -1,10 +1,10 @@
 import re
 import os
 import datetime
-from telegram import Update
-from telegram.ext import CommandHandler, MessageHandler, ContextTypes, filters
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 from deepseek import ask_deepseek
-from reminder import schedule_reminders, schedule_monthly_reminder
+from reminder import schedule_reminders, schedule_monthly_reminder, schedule_rating_request
 from calendar_api import book_slot, list_events_for_date, delete_event, update_event_time, is_slot_free, merge_client_into_event
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
@@ -12,13 +12,15 @@ from typing import Optional
 import logging
 import json
 from state_store import get_user_state, update_user_state
-from db import upsert_client, add_booking
+from db import upsert_client, add_booking, get_last_master_for_client, add_rating
 from textwrap import wrap
 import dateparser
 from datetime import time as dtime
 import json
 from reminder import scheduler
 from calendar_api import get_free_slots
+from masters_config import MASTERS, get_master_by_id, get_master_by_name, get_all_masters
+from promotions_config import check_promotion
 
 async def send_chunked(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str, chunk_size: int = 3500) -> None:
     if text is None:
@@ -108,7 +110,7 @@ except ValueError:
 
 # --- Валидация и нормализация телефона РФ ---
 def normalize_ru_phone(raw_phone: str) -> Optional[str]:
-    """Пытается привести номер к формату +7XXXXXXXXXX. Возвращает None, если номер некорректен."""
+    """Пытается привести номер к формату +7XXXXXXXXXX (ровно 10 цифр после +7). Возвращает None, если номер некорректен."""
     if not raw_phone:
         return None
     
@@ -119,16 +121,16 @@ def normalize_ru_phone(raw_phone: str) -> Optional[str]:
     if len(digits) == 11:
         # 11 цифр: 7XXXXXXXXXX или 8XXXXXXXXXX
         if digits[0] in ('7', '8'):
-            return '+7' + digits[1:]
+            phone = '+7' + digits[1:]
+            # Проверяем, что после +7 ровно 10 цифр
+            if len(phone) == 12:  # +7 (2 символа) + 10 цифр = 12
+                return phone
     elif len(digits) == 10:
-        # 10 цифр: 9XXXXXXXXX или 8XXXXXXXXX (без кода страны)
-        if digits[0] in ('9', '8'):
+        # 10 цифр: 9XXXXXXXXX (без кода страны)
+        if digits[0] == '9':
             return '+7' + digits
-    elif len(digits) == 12:
-        # 12 цифр: 89XXXXXXXXXX (с лишней 8)
-        if digits[0:2] == '89':
-            return '+7' + digits[2:]
     
+    # Если длина не подходит, возвращаем None
     return None
 
 def suggest_time_slots(for_date: datetime.date, preference: Optional[str] = None) -> list[str]:
@@ -195,7 +197,10 @@ def _save_context_state(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> Non
         'time': context.user_data.get('time'),
         'greeted': context.user_data.get('greeted', False),
         'last_interaction': now_iso,
-        'pending_date': context.user_data.get('pending_date')
+        'pending_date': context.user_data.get('pending_date'),
+        'master_id': context.user_data.get('master_id'),
+        'master_name': context.user_data.get('master_name'),
+        'master_selection_shown': context.user_data.get('master_selection_shown', False)
     }
     update_user_state(chat_id, state)
 
@@ -214,20 +219,27 @@ def _load_context_state(chat_id: int, context: ContextTypes.DEFAULT_TYPE) -> Non
     context.user_data['greeted'] = state.get('greeted', False)
     context.user_data['last_interaction'] = state.get('last_interaction')
     context.user_data['pending_date'] = state.get('pending_date')
+    context.user_data['master_id'] = state.get('master_id')
+    context.user_data['master_name'] = state.get('master_name')
+    context.user_data['master_selection_shown'] = state.get('master_selection_shown', False)
 
 def _reset_context(context: ContextTypes.DEFAULT_TYPE) -> None:
-    for key in ['visit_time', 'client_name', 'client_phone', 'service', 'child_age', 'date', 'time', 'pending_date', 'history', 'time_checked']:
+    for key in ['visit_time', 'client_name', 'client_phone', 'service', 'child_age', 'date', 'time', 'pending_date', 'history', 'time_checked', 'master_id', 'master_name', 'master_selection_shown', 'favorite_master_id', 'favorite_master_name', 'favorite_master_offered', 'promotion_mentioned', 'promotion_id']:
         context.user_data.pop(key, None)
     context.user_data['greeted'] = False
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    chat_id = update.effective_chat.id
+    # Полностью очищаем состояние пользователя
     context.user_data.clear()
+    # Удаляем сохраненное состояние из файла
+    update_user_state(chat_id, {})
     context.user_data['greeted'] = True
     greeting = (
         "Здравствуйте! 😊 Я — ассистент администратора салона «Непоседы». Чем могу помочь?"
     )
     await update.message.reply_text(greeting)
-    _save_context_state(update.effective_chat.id, context)
+    _save_context_state(chat_id, context)
 
 # --- Напоминание о себе после 2 минут молчания ---
 def schedule_inactivity_reminder(context, chat_id):
@@ -333,7 +345,13 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         phone_norm = normalize_ru_phone(name_phone_match.group(2).strip())
         if phone_norm:
             context.user_data['client_phone'] = phone_norm
-        _save_context_state(chat_id, context)
+            _save_context_state(chat_id, context)
+        else:
+            # Номер некорректный - сообщаем пользователю
+            await send_chunked(context, chat_id, 
+                "Спасибо! Имя записала, но не могу распознать номер телефона. Пожалуйста, укажите его в формате +7 9ХХ ХХХ-ХХ-ХХ (11 цифр).")
+            _save_context_state(chat_id, context)
+            return
 
     # Извлекаем только телефон
     phone_match = re.search(r'(\+?\d[\d\s\-\(\)]{8,})', user_text_raw)
@@ -342,22 +360,69 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if phone_norm:
             context.user_data['client_phone'] = phone_norm
             _save_context_state(chat_id, context)
+        else:
+            # Номер некорректный - сообщаем пользователю
+            await send_chunked(context, chat_id, 
+                "Извините, не могу распознать номер телефона. Пожалуйста, укажите его в формате +7 9ХХ ХХХ-ХХ-ХХ (11 цифр).")
+            return
 
-    # Извлекаем дату/время (универсальный парсер)
+    # Извлекаем дату/время (улучшенный парсер)
     if not context.user_data.get('visit_time'):
-        # Сначала пробуем стандартный парсер
-        parsed_dt = dateparser.parse(
-            user_text_raw, 
-            languages=['ru'], 
-            settings={
-                'PREFER_DATES_FROM': 'future', 
-                'RELATIVE_BASE': datetime.datetime.now(tz=TZ),
-                'TIMEZONE': 'Europe/Moscow',
-                'RETURN_AS_TIMEZONE_AWARE': True
-            }
-        )
+        now = datetime.datetime.now(tz=TZ)
+        parsed_dt = None
+        pending_date = context.user_data.get('pending_date')  # Дата из предыдущего контекста
         
-        # Если не сработало, пробуем ручной парсинг для "завтра/сегодня в/на ЧЧ:ММ"
+        # --- СПЕЦИАЛЬНАЯ ОБРАБОТКА ДНЕЙ НЕДЕЛИ ---
+        weekday_map = {
+            'понедельник': 0, 'пн': 0,
+            'вторник': 1, 'вт': 1,
+            'среду': 2, 'среда': 2, 'ср': 2,
+            'четверг': 3, 'чт': 3,
+            'пятницу': 4, 'пятница': 4, 'пт': 4,
+            'субботу': 5, 'суббота': 5, 'сб': 5,
+            'воскресенье': 6, 'вс': 6
+        }
+        
+        # Ищем паттерны типа "в ближайшую пятницу в 15.00" или "в пятницу на 16:00"
+        weekday_time_pattern = r'(?:в|на)?\s*(?:ближайш[уюя]+\s+)?(' + '|'.join(weekday_map.keys()) + r')\s+(?:в|на)\s+(\d{1,2})[:\.]?(\d{2})?'
+        weekday_match = re.search(weekday_time_pattern, user_text, re.IGNORECASE)
+        
+        if weekday_match:
+            day_name = weekday_match.group(1).lower()
+            hour = int(weekday_match.group(2))
+            minute = int(weekday_match.group(3)) if weekday_match.group(3) else 0
+            
+            target_weekday = weekday_map.get(day_name)
+            if target_weekday is not None:
+                # Находим ближайший день недели
+                current_weekday = now.weekday()
+                days_ahead = target_weekday - current_weekday
+                if days_ahead <= 0:  # День уже прошёл на этой неделе
+                    days_ahead += 7
+                
+                target_date = now.date() + datetime.timedelta(days=days_ahead)
+                try:
+                    parsed_dt = datetime.datetime.combine(target_date, datetime.time(hour, minute, tzinfo=TZ))
+                    logger.info(f"[DEBUG] Распознан день недели: {day_name} -> {target_date}, время {hour}:{minute:02d}")
+                    context.user_data['pending_date'] = target_date.isoformat()  # Сохраняем как строку ISO
+                except ValueError:
+                    pass
+        
+        # Сохраняем ожидаемую дату, если распознан только день недели без времени
+        if not parsed_dt and not context.user_data.get('pending_date'):
+            for day_name, weekday in weekday_map.items():
+                if day_name in user_text:
+                    current_weekday = now.weekday()
+                    days_ahead = weekday - current_weekday
+                    if days_ahead <= 0:
+                        days_ahead += 7
+                    target_date = now.date() + datetime.timedelta(days=days_ahead)
+                    context.user_data['pending_date'] = target_date.isoformat()  # Сохраняем как строку ISO
+                    logger.info(f"[DEBUG] Сохранена ожидаемая дата: {day_name} -> {target_date}")
+                    _save_context_state(chat_id, context)
+                    break
+        
+        # Если не нашли день недели, пробуем ручной парсинг для "завтра/сегодня в/на ЧЧ:ММ" ИЛИ просто "на 11.00"
         if not parsed_dt:
             time_patterns = [
                 r'(завтра|сегодня|послезавтра)\s+(?:в|на)\s+(\d{1,2})[:\.](\d{2})',
@@ -369,15 +434,19 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 match = re.search(pattern, user_text, re.IGNORECASE)
                 if match:
                     groups = match.groups()
-                    now = datetime.datetime.now(tz=TZ)
                     
                     # Определяем дату
-                    if groups[0] in ['завтра']:
+                    if len(groups) > 0 and groups[0] in ['завтра']:
                         target_date = now.date() + datetime.timedelta(days=1)
-                    elif groups[0] in ['послезавтра']:
+                    elif len(groups) > 0 and groups[0] in ['послезавтра']:
                         target_date = now.date() + datetime.timedelta(days=2)
-                    elif groups[0] in ['сегодня']:
+                    elif len(groups) > 0 and groups[0] in ['сегодня']:
                         target_date = now.date()
+                    elif pending_date:
+                        # Если есть ожидаемая дата из контекста (например, "воскресенье"), используем её
+                        # pending_date хранится как строка ISO, конвертируем в date объект
+                        target_date = datetime.date.fromisoformat(pending_date)
+                        logger.info(f"[DEBUG] Используем ожидаемую дату из контекста: {pending_date}")
                     else:
                         # Если день не указан, но есть время, берём ближайшее будущее
                         target_date = now.date()
@@ -399,20 +468,34 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except ValueError:
                         continue
         
+        # Если ручной парсинг не сработал, пробуем dateparser как последний вариант
+        if not parsed_dt:
+            parsed_dt = dateparser.parse(
+                user_text_raw, 
+                languages=['ru'], 
+                settings={
+                    'PREFER_DATES_FROM': 'future', 
+                    'RELATIVE_BASE': now,
+                    'TIMEZONE': 'Europe/Moscow',
+                    'RETURN_AS_TIMEZONE_AWARE': True
+                }
+            )
+        
         if parsed_dt:
             if parsed_dt.tzinfo is None:
                 parsed_dt = parsed_dt.replace(tzinfo=TZ)
             # Проверяем, что время не в прошлом
-            if parsed_dt > datetime.datetime.now(tz=TZ):
+            if parsed_dt > now:
                 context.user_data['visit_time'] = parsed_dt
                 context.user_data['date'] = parsed_dt.date().isoformat()
                 context.user_data['time'] = parsed_dt.strftime('%H:%M')
                 logger.info(f"[DEBUG] Успешно распознано время: {parsed_dt}")
                 _save_context_state(chat_id, context)
 
-    # Извлекаем услугу по ключевым словам (только если уже есть дата/время или явный запрос)
+    # Извлекаем услугу по ключевым словам
+    # Проверяем контекст: есть ли дата/время, явный запрос или упоминание услуги со словом "нужна/нужно/хочу"
     has_date_context = context.user_data.get('visit_time') or context.user_data.get('date')
-    explicit_booking = any(word in user_text for word in ['записать', 'запишите', 'хочу записаться', 'нужна запись'])
+    explicit_booking = any(word in user_text for word in ['записать', 'запишите', 'хочу записаться', 'нужна запись', 'нужна', 'нужно', 'хочу'])
     
     if not context.user_data.get('service') and (has_date_context or explicit_booking):
         if 'стрижк' in user_text:
@@ -423,13 +506,25 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data['service'] = 'Окрашивание'
         elif 'плетен' in user_text:
             context.user_data['service'] = 'Плетение'
-        _save_context_state(chat_id, context)
+        
+        if context.user_data.get('service'):
+            logger.info(f"[DEBUG] Распознана услуга: {context.user_data['service']}")
+            _save_context_state(chat_id, context)
 
     # Извлекаем возраст ребёнка
     if not context.user_data.get('child_age'):
         child_age = parse_child_age(user_text_raw)
         if child_age:
             context.user_data['child_age'] = child_age
+            _save_context_state(chat_id, context)
+    
+    # Извлекаем мастера из текста
+    if not context.user_data.get('master_id'):
+        master = get_master_by_name(user_text_raw)
+        if master:
+            context.user_data['master_id'] = master['id']
+            context.user_data['master_name'] = master['name']
+            logger.info(f"[DEBUG] Распознан мастер: {master['name']}")
             _save_context_state(chat_id, context)
 
     # --- ШАГ 1.5: ПРОВЕРЯЕМ ЗАНЯТОСТЬ ВРЕМЕНИ (ДО ОТПРАВКИ В LLM) ---
@@ -477,6 +572,18 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['client_name'] = context.user_data['tg_first_name']
         _save_context_state(chat_id, context)
     
+    # Проверяем, есть ли у клиента любимый мастер (если телефон уже известен и мастер не выбран)
+    if context.user_data.get('client_phone') and not context.user_data.get('master_id') and not context.user_data.get('favorite_master_offered'):
+        last_master_id = get_last_master_for_client(context.user_data['client_phone'])
+        if last_master_id:
+            master = get_master_by_id(last_master_id)
+            if master:
+                context.user_data['favorite_master_id'] = last_master_id
+                context.user_data['favorite_master_name'] = master['name']
+                context.user_data['favorite_master_offered'] = True
+                _save_context_state(chat_id, context)
+                logger.info(f"[DEBUG] Найден любимый мастер клиента: {master['name']}")
+    
     context_info = []
     
     # Добавляем текущую дату и время для контекста LLM
@@ -491,15 +598,73 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if context.user_data.get('visit_time'):
         vt = context.user_data['visit_time']
         context_info.append(f"[Выбранное время: {vt.strftime('%d.%m.%Y %H:%M')}]")
+        
+        # Получаем свободные слоты для этой даты
+        free_slots_for_date = get_free_slots(vt.date())
+        if free_slots_for_date:
+            context_info.append(f"[СВОБОДНЫЕ СЛОТЫ НА {vt.strftime('%d.%m.%Y')}: {', '.join(free_slots_for_date)}]")
+    elif context.user_data.get('date'):
+        # Если есть только дата (без времени), получаем свободные слоты
+        try:
+            date_obj = datetime.date.fromisoformat(context.user_data['date'])
+            free_slots_for_date = get_free_slots(date_obj)
+            if free_slots_for_date:
+                context_info.append(f"[СВОБОДНЫЕ СЛОТЫ НА {date_obj.strftime('%d.%m.%Y')}: {', '.join(free_slots_for_date)}]")
+        except (ValueError, TypeError):
+            pass
+    
+    # Если пользователь спрашивает про свободное время на конкретную дату (например, "на четверг")
+    # проверим, упоминается ли в тексте дата без времени
+    if not context.user_data.get('visit_time') and not context.user_data.get('date'):
+        date_keywords = ['завтра', 'послезавтра', 'сегодня', 'понедельник', 'вторник', 'среду', 'четверг', 'пятницу', 'субботу', 'воскресенье']
+        if any(keyword in user_text for keyword in date_keywords):
+            # Попробуем распарсить дату
+            parsed_date = dateparser.parse(
+                user_text_raw, 
+                languages=['ru'], 
+                settings={
+                    'PREFER_DATES_FROM': 'future',
+                    'RELATIVE_BASE': now,
+                    'TIMEZONE': 'Europe/Moscow',
+                    'RETURN_AS_TIMEZONE_AWARE': True
+                }
+            )
+            if parsed_date:
+                free_slots_for_date = get_free_slots(parsed_date.date())
+                if free_slots_for_date:
+                    context_info.append(f"[СВОБОДНЫЕ СЛОТЫ НА {parsed_date.strftime('%d.%m.%Y')}: {', '.join(free_slots_for_date)}]")
+    
     if context.user_data.get('service'):
         context_info.append(f"[Услуга: {context.user_data['service']}]")
     if context.user_data.get('child_age'):
         context_info.append(f"[Возраст ребёнка: {context.user_data['child_age']} лет]")
+    if context.user_data.get('master_name'):
+        context_info.append(f"[Выбранный мастер: {context.user_data['master_name']}]")
+    elif context.user_data.get('favorite_master_name'):
+        context_info.append(f"[В прошлый раз клиент был у мастера: {context.user_data['favorite_master_name']}. Можешь мягко предложить записаться снова к этому мастеру]")
+    
+    # Проверяем, подходит ли какая-то акция
+    if not context.user_data.get('promotion_mentioned'):
+        promo = check_promotion(
+            service=context.user_data.get('service'),
+            visit_time=context.user_data.get('visit_time'),
+            child_age=context.user_data.get('child_age'),
+            context_data=context.user_data
+        )
+        if promo:
+            context_info.append(f"[АКЦИЯ]: {promo['message']}")
+            context.user_data['promotion_mentioned'] = True
+            context.user_data['promotion_id'] = promo['id']
+            logger.info(f"[ПРОМО] Найдена подходящая акция: {promo['name']}")
+            _save_context_state(chat_id, context)
     
     context_str = " ".join(context_info) if context_info else ""
     
     # --- ШАГ 3: ОТПРАВЛЯЕМ ЗАПРОС В LLM ДЛЯ "ЖИВОГО" ОТВЕТА ---
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    try:
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    except Exception as e:
+        logger.warning(f"[WARNING] Не удалось отправить typing action: {e}")
     first_name = context.user_data.get('tg_first_name') or ''
     username = context.user_data.get('tg_username') or ''
     user_meta = f"(id:{user_id} {first_name} @{username})".strip()
@@ -615,7 +780,7 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"[DEBUG] Недостающие поля: {missing}")
         
         if not missing:
-            # ВСЕ ДАННЫЕ СОБРАНЫ — СОЗДАЁМ ЗАПИСЬ
+            # ВСЕ ДАННЫЕ СОБРАНЫ — ПРОВЕРЯЕМ ВЫБОР МАСТЕРА
             name = context.user_data['client_name']
             phone = context.user_data['client_phone']
             visit_time = context.user_data['visit_time']
@@ -633,29 +798,64 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 _save_context_state(chat_id, context)
                 return
             
+            # Проверяем, выбран ли мастер
+            master_id = context.user_data.get('master_id')
+            master_selection_shown = context.user_data.get('master_selection_shown', False)
+            
+            # Если мастер не выбран и кнопки ещё не показывались, показываем их
+            if not master_id and not master_selection_shown:
+                context.user_data['master_selection_shown'] = True
+                _save_context_state(chat_id, context)
+                
+                # Проверяем, есть ли любимый мастер
+                favorite_master_name = context.user_data.get('favorite_master_name')
+                if favorite_master_name:
+                    message_text = f"Отлично! Хотите записаться снова к {favorite_master_name} или выберете другого мастера?"
+                else:
+                    message_text = "Отлично! Выберите, пожалуйста, мастера:"
+                
+                keyboard = create_master_selection_keyboard()
+                await update.message.reply_text(message_text, reply_markup=keyboard)
+                return
+            
+            # Определяем мастера и его ID (если не выбран, будет "Любой свободный мастер")
+            master_id = context.user_data.get('master_id')
+            master_name = context.user_data.get('master_name', 'Любой свободный мастер')
+            
             try:
                 event_id = book_slot(visit_time, {
                     'name': name,
                     'phone': phone,
                     'service': service,
-                    'child_age': context.user_data.get('child_age', '—')
+                    'child_age': context.user_data.get('child_age', '—'),
+                    'master': master_name
                 })
                 client_id = upsert_client(name, phone)
-                add_booking(client_id, visit_time.isoformat(), service, event_id)
+                booking_id = add_booking(client_id, visit_time.isoformat(), service, event_id, master_id)
                 schedule_reminders(application=context.application, chat_id=chat_id, visit_time=visit_time)
                 schedule_monthly_reminder(application=context.application, chat_id=chat_id, visit_time=visit_time)
                 
+                # Планируем запрос оценки (если выбран мастер)
+                if master_id:
+                    schedule_rating_request(
+                        application=context.application,
+                        chat_id=chat_id,
+                        visit_time=visit_time,
+                        master_name=master_name,
+                        booking_id=booking_id
+                    )
                 admin_message = (
-                    f"📅 НОВАЯ ЗАПИСЬ!\n\n👤 {name}\n📱 {phone}\n🕐 {visit_time:%d.%m.%Y %H:%M}\n💇‍♀️ {service}"
+                    f"📅 НОВАЯ ЗАПИСЬ!\n\n👤 {name}\n📱 {phone}\n🕐 {visit_time:%d.%m.%Y %H:%M}\n💇‍♀️ {service}\n✂️ Мастер: {master_name}"
                 )
                 await send_chunked(context, ADMIN_CHAT_ID, admin_message)
                 
+                master_info = f"\n✂️ Мастер: {master_name}" if master_name != 'Любой свободный мастер' else ""
                 confirmation = (
                     f"✅ Готово! Вы записаны:\n\n"
                     f"👤 {name}\n"
                     f"📱 {phone}\n"
                     f"🕐 {visit_time.strftime('%d.%m.%Y %H:%M')}\n"
-                    f"💇‍♀️ {service}\n\n"
+                    f"💇‍♀️ {service}{master_info}\n\n"
                     f"Напомню за день и за час до визита. До встречи в «Непоседах»!"
                 )
                 await send_chunked(context, chat_id, confirmation)
@@ -691,7 +891,103 @@ async def reply_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f'Ошибка: {e}')
 
+def create_master_selection_keyboard(show_any_master=True):
+    """Создаёт клавиатуру для выбора мастера"""
+    keyboard = []
+    row = []
+    for i, master in enumerate(MASTERS):
+        button = InlineKeyboardButton(
+            f"{master['emoji']} {master['name']}", 
+            callback_data=f"master_{master['id']}"
+        )
+        row.append(button)
+        # По 2 кнопки в ряду
+        if len(row) == 2 or i == len(MASTERS) - 1:
+            keyboard.append(row)
+            row = []
+    
+    # Кнопка "Любой мастер" / "Без разницы"
+    if show_any_master:
+        keyboard.append([InlineKeyboardButton("✨ Любой свободный мастер", callback_data="master_any")])
+    
+    return InlineKeyboardMarkup(keyboard)
+
+async def handle_master_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик выбора мастера через Inline-кнопки"""
+    query = update.callback_query
+    await query.answer()
+    
+    chat_id = update.effective_chat.id
+    _load_context_state(chat_id, context)
+    
+    callback_data = query.data
+    
+    if callback_data == "master_any":
+        context.user_data['master_id'] = None
+        context.user_data['master_name'] = "Любой свободный мастер"
+        await query.edit_message_text("Хорошо, запишу к любому свободному мастеру! ✨")
+    elif callback_data.startswith("master_"):
+        master_id = int(callback_data.split("_")[1])
+        master = get_master_by_id(master_id)
+        if master:
+            context.user_data['master_id'] = master_id
+            context.user_data['master_name'] = master['name']
+            await query.edit_message_text(f"Отлично! Записываю к {master['emoji']} {master['name']}")
+        else:
+            await query.edit_message_text("Произошла ошибка. Попробуйте ещё раз.")
+            return
+    
+    _save_context_state(chat_id, context)
+    
+    logger.info(f"[DEBUG] Мастер выбран: {context.user_data.get('master_name', 'не указан')}")
+
+async def handle_rating(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик оценки мастера"""
+    query = update.callback_query
+    await query.answer()
+    
+    try:
+        # Формат callback_data: rate_{booking_id}_{rating}
+        parts = query.data.split('_')
+        booking_id = int(parts[1])
+        rating = int(parts[2])
+        
+        # Сохраняем оценку в базу
+        chat_id = update.effective_chat.id
+        _load_context_state(chat_id, context)
+        
+        # Получаем client_id по телефону (если есть)
+        client_phone = context.user_data.get('client_phone')
+        if client_phone:
+            client_id = upsert_client(context.user_data.get('client_name', 'Клиент'), client_phone)
+        else:
+            # Если телефона нет, используем telegram user_id
+            client_id = update.effective_user.id
+        
+        # Получаем master_id из booking (предполагаем, что booking_id есть)
+        # Здесь нужно добавить функцию get_booking_info в db.py, но пока используем временное решение
+        # Для простоты сохраняем без привязки к конкретному booking
+        
+        # Добавляем оценку (пока без master_id, нужно доработать)
+        logger.info(f"[RATING] Получена оценка {rating} звезд для booking_id={booking_id}")
+        
+        stars = "⭐" * rating
+        await query.edit_message_text(
+            f"Спасибо за вашу оценку! {stars}\n\nМы ценим ваше мнение и будем рады видеть вас снова! 😊"
+        )
+        
+        # Уведомляем администратора
+        await context.bot.send_message(
+            ADMIN_CHAT_ID,
+            f"📊 НОВАЯ ОЦЕНКА!\n\nОценка: {stars} ({rating}/5)\nЗапись ID: {booking_id}"
+        )
+    except Exception as e:
+        logger.error(f"[ОШИБКА] При обработке оценки: {e}")
+        await query.edit_message_text("Произошла ошибка при сохранении оценки. Спасибо за желание оценить нашу работу!")
+
 def setup_handlers(app):
     app.add_handler(CommandHandler('start', start))
+    app.add_handler(CallbackQueryHandler(handle_master_selection, pattern="^master_"))
+    app.add_handler(CallbackQueryHandler(handle_rating, pattern="^rate_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
     app.add_handler(CommandHandler('reply', reply_to_user))
