@@ -1,18 +1,22 @@
 {
   "613340341": {
-    "visit_time": null,
+    "visit_time": "2025-11-09T12:00:00+03:00",
     "client_name": "Максим",
-    "client_phone": null,
-    "service": null,
+    "client_phone": "+79784563111",
+    "service": "Стрижка",
     "child_age": null,
-    "date": null,
-    "time": null,
-    "greeted": false,
-    "last_interaction": "2025-10-31T22:33:39.145958+03:00",
-    "pending_date": null,
+    "date": "2025-11-09",
+    "time": "12:00",
+    "greeted": true,
+    "last_interaction": "2025-11-08T19:39:26.371582+03:00",
+    "pending_date": "2025-11-11",
     "master_id": null,
     "master_name": null,
-    "master_selection_shown": false
+    "master_selection_shown": true,
+    "phone_refused": false,
+    "recent_booking": null,
+    "last_visit_time": null,
+    "last_service": null
   },
   "5348618098": {
     "visit_time": "2025-11-01T10:00:00+03:00",
