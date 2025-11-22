@@ -5,7 +5,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import CommandHandler, MessageHandler, ContextTypes, filters, CallbackQueryHandler
 from deepseek import ask_deepseek
 from reminder import schedule_reminders, schedule_monthly_reminder, schedule_rating_request
-from calendar_api import book_slot, list_events_for_date, delete_event, update_event_time, is_slot_free, merge_client_into_event
+from calendar_api import book_slot, list_events_for_date, delete_event, update_event_time, is_slot_free, merge_client_into_event, get_free_masters_for_slot, get_master_by_id, get_master_name
 from dotenv import load_dotenv
 from zoneinfo import ZoneInfo
 from typing import Optional
@@ -1113,58 +1113,71 @@ async def reply_to_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f'Ошибка: {e}')
 
-def create_master_selection_keyboard(show_any_master=False):
-    """Создаёт клавиатуру для выбора мастера"""
+def create_master_selection_keyboard(master_ids=None, show_any_master=False):
+    """
+    Создаёт клавиатуру для выбора мастера. Если master_ids — показать только этих мастеров.
+    """
     keyboard = []
     row = []
     all_masters = get_all_masters()
-    masters_list = list(all_masters.values())
-    
+    masters_list = (
+        [all_masters[mid] for mid in master_ids if mid in all_masters]
+        if master_ids else list(all_masters.values())
+    )
     for i, master in enumerate(masters_list):
         button = InlineKeyboardButton(
-            f"{master['emoji']} {master['name']}", 
+            f"{master['emoji']} {master['name']}",
             callback_data=f"master_{master['id']}"
         )
         row.append(button)
-        # По 2 кнопки в ряду
         if len(row) == 2 or i == len(masters_list) - 1:
             keyboard.append(row)
             row = []
-    
-    # ВАЖНО: Теперь выбор мастера обязателен, кнопка "Любой мастер" по умолчанию отключена
-    # Можно включить, передав show_any_master=True
     if show_any_master:
-        keyboard.append([InlineKeyboardButton("✨ Любой свободный мастер", callback_data="master_any")])
-    
+        keyboard.append([
+            InlineKeyboardButton("✨ Любой свободный мастер", callback_data="master_any")
+        ])
     return InlineKeyboardMarkup(keyboard)
 
 async def handle_master_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик выбора мастера через Inline-кнопки"""
     query = update.callback_query
     await query.answer()
-    
     chat_id = update.effective_chat.id
     _load_context_state(chat_id, context)
-    
     callback_data = query.data
-    
+    from calendar_api import get_free_masters_for_slot # важно импортировать
+
     if callback_data == "master_any":
         context.user_data['master_id'] = None
         context.user_data['master_name'] = "Любой свободный мастер"
         await query.edit_message_text("Хорошо, запишу к любому свободному мастеру! ✨")
     elif callback_data.startswith("master_"):
-        # Извлекаем master_id (теперь это строка, например "master_1")
-        master_id = callback_data  # "master_master_1" -> нужно взять всё после первого "master_"
-        master_id = "_".join(callback_data.split("_")[1:])  # "master_1"
+        master_id = "_".join(callback_data.split("_")[1:])
         master = get_master_by_id(master_id)
         if master:
             context.user_data['master_id'] = master_id
             context.user_data['master_name'] = master['name']
+            visit_time = context.user_data.get('visit_time')
+            # Финальная проверка: свободен ли мастер
+            if visit_time and not is_slot_free(visit_time, master_id):
+                # Считаем, кто ещё реально свободен на этот слот (кроме этого мастера)
+                all_free = get_free_masters_for_slot(visit_time.date(), visit_time.hour, visit_time.minute)
+                all_free = [mid for mid in all_free if mid != master_id]
+                if all_free:
+                    await query.edit_message_text(f"К сожалению, {master['name']} уже занят на {visit_time.strftime('%d.%m.%Y %H:%M')} — но доступны другие мастера:")
+                    keyboard = create_master_selection_keyboard(all_free)
+                    await query.message.reply_text("Кто из оставшихся мастеров вам подойдёт?", reply_markup=keyboard)
+                else:
+                    await query.edit_message_text(f"В это время на {visit_time.strftime('%d.%m.%Y %H:%M')} все мастера уже заняты 💔. Посмотрите, пожалуйста, другие доступные варианты времени. Я помогу подобрать! ✨")
+                    context.user_data.pop('visit_time', None)
+                context.user_data.pop('master_id', None)
+                context.user_data.pop('master_name', None)
+                _save_context_state(chat_id, context)
+                return
             await query.edit_message_text(f"Отлично! Записываю к {master['emoji']} {master['name']}")
         else:
             await query.edit_message_text("Произошла ошибка. Попробуйте ещё раз.")
             return
-    
     _save_context_state(chat_id, context)
     
     logger.info(f"[DEBUG] Мастер выбран: {context.user_data.get('master_name', 'не указан')}")
@@ -1295,3 +1308,6 @@ def setup_handlers(app):
     app.add_handler(CallbackQueryHandler(handle_rating, pattern="^rate_"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo))
     app.add_handler(CommandHandler('reply', reply_to_user))
+
+async def send_neutral_after_phone(context, chat_id):
+    await context.bot.send_message(chat_id, "Спасибо! Сейчас предложу выбрать мастера.")

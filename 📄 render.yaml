@@ -1,0 +1,7 @@
+services:
+  - type: worker
+    name: neposedyi-bot
+    env: python
+    buildCommand: ""
+    startCommand: python main.py
+    autoDeploy: true

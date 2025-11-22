@@ -3,7 +3,7 @@ from googleapiclient.discovery import build
 from google.oauth2 import service_account
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-from masters_config import get_master_calendar_id, get_all_masters
+from masters_config import get_master_calendar_id, get_all_masters, get_master_by_id, get_master_name
 
 SCOPES = ['https://www.googleapis.com/auth/calendar']
 SERVICE_ACCOUNT_FILE = os.getenv('GOOGLE_SERVICE_ACCOUNT_JSON', 'credentials.json')
@@ -112,6 +112,36 @@ def get_free_slots(date, master_id=None):
         print(f"[ОШИБКА] Не удалось получить свободные слоты: {e}")
         return ['10:00', '11:00', '12:00', '13:00', '14:00', '15:00', '16:00', '17:00', '18:00']
 
+def get_free_masters_for_slot(date, hour, minute=0):
+    """
+    Вернет список master_id для мастеров, которые свободны в указанный день и час (1-часовой слот).
+    """
+    service = get_service()
+    if not service:
+        return []
+
+    try:
+        start_dt = datetime.combine(date, datetime.time(hour, minute), tzinfo=TZ)
+        end_dt = start_dt + timedelta(hours=1)
+        free_masters = []
+        all_masters = get_all_masters()
+        for master_id, master_data in all_masters.items():
+            calendar_id = master_data.get('calendar_id')
+            if not calendar_id:
+                continue
+            events = service.events().list(
+                calendarId=calendar_id,
+                timeMin=start_dt.isoformat(),
+                timeMax=end_dt.isoformat(),
+                singleEvents=True,
+            ).execute().get('items', [])
+            if len(events) == 0:
+                free_masters.append(master_id)
+        return free_masters
+    except Exception as e:
+        print(f"[ОШИБКА] get_free_masters_for_slot: {e}")
+        return []
+
 def is_slot_free(slot_time: datetime, master_id: str = None) -> bool:
     """Проверить, свободен ли слот (1 час с указанного времени).
     
@@ -195,7 +225,6 @@ def book_slot(slot_time, client_data, master_id: str):
         start_dt = slot_time.replace(tzinfo=TZ)
         end_dt = (slot_time + timedelta(hours=1)).replace(tzinfo=TZ)
         
-        from masters_config import get_master_name
         master_name = get_master_name(master_id)
         
         event = {
