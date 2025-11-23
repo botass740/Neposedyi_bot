@@ -1,7 +1,7 @@
 import os
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from zoneinfo import ZoneInfo
 from masters_config import get_master_calendar_id, get_all_masters, get_master_by_id, get_master_name
 
@@ -121,7 +121,7 @@ def get_free_masters_for_slot(date, hour, minute=0):
         return []
 
     try:
-        start_dt = datetime.combine(date, datetime.time(hour, minute), tzinfo=TZ)
+        start_dt = datetime.combine(date, time(hour, minute), tzinfo=TZ)
         end_dt = start_dt + timedelta(hours=1)
         free_masters = []
         all_masters = get_all_masters()

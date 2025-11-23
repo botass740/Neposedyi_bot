@@ -683,7 +683,7 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data['service'] = 'Стрижка'
         elif 'укладк' in user_text:
             context.user_data['service'] = 'Укладка'
-        elif 'окраш' in user_text or 'колор' in user_text:
+        elif ('окраш' in user_text or 'колор' in user_text or 'окраск' in user_text or 'окрас ' in user_text):
             context.user_data['service'] = 'Окрашивание'
         elif 'плетен' in user_text:
             context.user_data['service'] = 'Плетение'
@@ -870,6 +870,48 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.info(f"[ОТЛАДКА] Ответ ИИ: {response}")
         
         if response and response != "Извините, сейчас не могу ответить. Попробуйте позже.":
+            # Фильтр: убираем преждевременные подтверждения записи из ответа LLM
+            dangerous_phrases = [
+                'вы записаны',
+                'вы уже записаны',
+                'записал вас',
+                'записала вас',
+                'записал к',
+                'записала к',
+            ]
+            lowered = response.lower()
+            if any(phrase in lowered for phrase in dangerous_phrases):
+                logger.info("[LLM_FILTER] Обнаружены фразы подтверждения записи в ответе LLM, заменяем на нейтральные")
+                for phrase in dangerous_phrases:
+                    if phrase in lowered:
+                        import re as _re
+                        pattern = _re.compile(_re.escape(phrase), _re.IGNORECASE)
+                        response = pattern.sub('помогу с записью и сейчас уточню нужные данные', response)
+                        lowered = response.lower()
+
+            # Дополнительный фильтр: если клиент явно отказался от телефона, не даём LLM навязывать контакты
+            phone_refused = context.user_data.get('phone_refused', False)
+            if phone_refused:
+                contact_phrases = [
+                    'номер телефона',
+                    'телефон для связи',
+                    'телефон для напоминания',
+                    'контакт для связи',
+                    'оставить контакт',
+                    'укажите телефон',
+                    'укажите номер',
+                    'email',
+                    'почту',
+                    'whatsapp',
+                ]
+                lowered = response.lower()
+                if any(p in lowered for p in contact_phrases):
+                    logger.info("[LLM_FILTER] Клиент отказался от телефона, переписываем ответ LLM на нейтральный шаблон без давления")
+                    response = (
+                        "Понимаю, вы не хотите оставлять контакты — это не проблема. "
+                        "Запись можно оформить и без номера телефона, просто напоминания приходить не будут. "
+                        "Давайте дальше выберем мастера и время, а я всё аккуратно зафиксирую."
+                    )
             history.append({"role": "assistant", "content": response})
             context.user_data['history'] = history
             _save_context_state(chat_id, context)
@@ -1074,7 +1116,7 @@ async def echo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 confirmation = (
                     f"✅ Готово! Вы записаны:\n\n"
                     f"👤 {name}\n"
-                    f"📱 {phone}\n"
+                    f"📱 {phone_to_use}\n"
                     f"🕐 {visit_time.strftime('%d.%m.%Y %H:%M')}\n"
                     f"💇‍♀️ {service}{master_info}\n\n"
                     f"Напомню за день и за час до визита. До встречи в «Непоседах»!"
@@ -1195,17 +1237,20 @@ async def handle_master_selection(update: Update, context: ContextTypes.DEFAULT_
         logger.error("[ОШИБКА] Попытка бронирования без выбора мастера")
         await query.message.reply_text("Ошибка: не выбран мастер. Пожалуйста, начните запись заново с /start")
         return
-    
-    if name and phone and visit_time and service:
+
+    # Телефон необязателен, если клиент явно отказался его предоставлять
+    phone_refused = context.user_data.get('phone_refused', False)
+    if name and visit_time and service and (phone or phone_refused):
+        phone_to_use = phone or 'Не указан'
         try:
             event_id = book_slot(visit_time, {
                 'name': name,
-                'phone': phone,
+                'phone': phone_to_use,
                 'service': service,
                 'child_age': context.user_data.get('child_age', '—'),
                 'master': master_name
             }, master_id)
-            client_id = upsert_client(name, phone)
+            client_id = upsert_client(name, phone_to_use)
             booking_id = add_booking(client_id, visit_time.isoformat(), service, event_id, master_id)
             schedule_reminders(application=context.application, chat_id=chat_id, visit_time=visit_time)
             schedule_monthly_reminder(application=context.application, chat_id=chat_id, visit_time=visit_time)
@@ -1242,11 +1287,12 @@ async def handle_master_selection(update: Update, context: ContextTypes.DEFAULT_
             logger.info(f"[ЗАПИСЬ СОЗДАНА] {name}, {phone}, {visit_time}, {service}")
             
             # Отправляем финальное подтверждение клиенту
+            phone_line = phone_to_use if phone_to_use != 'Не указан' else 'не указан'
             final_msg = (
                 f"✅ Отлично! Вы записаны на {service.lower()} "
                 f"{visit_time.strftime('%d.%m.%Y')} в {visit_time.strftime('%H:%M')}.\n\n"
                 f"Мастер: {master_name}\n"
-                f"Телефон для напоминания: {phone}\n\n"
+                f"Телефон для напоминания: {phone_line}\n\n"
                 f"Ждём вас в «Непоседах»! 🌸"
             )
             await context.bot.send_message(chat_id=chat_id, text=final_msg)
